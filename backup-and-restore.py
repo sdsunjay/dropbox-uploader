@@ -33,9 +33,10 @@ def load_file_paths(config_path, home_path):
     return file_paths
 
 
-def get_backup_path(local_file, backup_filename):
+def get_dropbox_path(local_file, backup_filename, verbose=True):
     backup_path = os.path.join(BACKUP_DIR, backup_filename)
-    print(f"Uploading {local_file} to Dropbox as {backup_path}...")
+    if verbose:
+        click.echo(f"Uploading {local_file} to Dropbox as {backup_path}...")
     return backup_path
 
 
@@ -51,7 +52,7 @@ def backup(dbx, local_file, backup_filename):
         return
 
     with open(local_file, "rb") as f:
-        backup_path = get_backup_path(local_file, backup_filename)
+        backup_path = get_dropbox_path(local_file, backup_filename)
 
         try:
             # We use WriteMode=overwrite to make sure that the settings in the file
@@ -75,7 +76,7 @@ def upload_large_files(dbx, local_file, backup_filename, file_size):
     CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB chunk size
 
     # Get the backup path for the file
-    backup_path = get_backup_path(local_file, backup_filename)
+    backup_path = get_dropbox_path(local_file, backup_filename)
 
     with open(local_file, "rb") as f:
         try:
@@ -107,8 +108,9 @@ def upload_large_files(dbx, local_file, backup_filename, file_size):
                 print(f"API error: {err}")
 
 
-def restore(dbx, backup_path, local_file, rev=None):
-    print(f"Restoring {backup_path} to revision {rev} on Dropbox...")
+def restore(dbx, local_file, backup_path, rev=None, verbose=True):
+    if verbose:
+        click.echo(f"Restoring {backup_path} to revision {rev} on Dropbox...")
 
     # Restore the file to the specified revision
     dbx.files_restore(backup_path, rev)
@@ -116,25 +118,28 @@ def restore(dbx, backup_path, local_file, rev=None):
     # Check if the local file exists and ask the user for confirmation
     if os.path.exists(local_file):
         overwrite = (
-            input(
-                f"{local_file} already exists. Do you want to overwrite it? (yes/no): "
+            click.prompt(
+                f"{local_file} already exists. Do you want to overwrite it? (y/n): ",
+                type=str,
+                default="n",
             )
             .strip()
             .lower()
         )
-        if overwrite != "yes":
+        if overwrite != "y":
             # Rename the file using its revision
             local_file = f"{local_file}_rev_{rev}"
 
     # Download the current version of the file from Dropbox
-    print(
+    click.echo(
         f"Downloading current version of {backup_path} from Dropbox, saving as {local_file}..."
     )
     with open(local_file, "wb") as f:
         metadata, res = dbx.files_download(path=backup_path)
         f.write(res.content)
 
-    print(f"Restored {local_file}")
+    if verbose:
+        click.secho(f"Restored {local_file}", fg="green")
 
 
 def check_files_exist(files):
@@ -173,22 +178,24 @@ def backup_files(ctx):
     for filename, full_path in file_paths.items():
         backup(dbx, full_path, filename)
 
-    print("All files backed up successfully.")
+    click.secho("All files backed up successfully.", fg="green")
 
 
 @click.command()
-@click.argument("file_path")
+@click.argument(
+    "file_path",
+    type=click.Path(
+        exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True
+    ),
+)
 @click.pass_context
 def backup_file(ctx, file_path):
     """Backup a user-specified file."""
-    if not os.path.exists(file_path):
-        print(f"File not found: {file_path}")
-        return
 
     dbx = ctx.obj["dbx"]
     filename = os.path.basename(file_path)
     backup(dbx, file_path, filename)
-    print(f"File {file_path} backed up successfully.")
+    click.secho(f"File {file_path} backed up successfully.", fg="green")
 
 
 def human_readable_size(size):
@@ -249,11 +256,11 @@ def help_select_revision(dbx, backup_path):
         )
 
         if 1 <= selected_index <= len(revisions):
-            return revisions[selected_index - 1].rev
+            return sorted_revisions[selected_index - 1].rev
         else:
             if selected_index == 0:
                 return None
-            print("Invalid selection. Please try again.")
+            click.secho("Invalid selection. Please try again.", fg="red")
 
 
 @click.command()
@@ -278,36 +285,68 @@ def select_revision(ctx):
         if revision:
             print(f"Selected revision: {revision}")
     else:
-        print("Invalid selection.")
+        click.secho("Invalid selection.", fg="red")
 
 
 @click.command()
-@click.argument("file_path")
+@click.argument(
+    "file_path",
+    type=click.Path(
+        exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True
+    ),
+)
 @click.option(
     "--revision",
     "-r",
     help="The revision to restore. If not provided, will prompt interactively.",
 )
+@click.option(
+    "--dropbox-path",
+    "-p",
+    help="The path of the file in Dropbox to be restored.",
+)
+@click.option("-v", "--verbose", is_flag=True, help="Enables verbose mode.")
 @click.pass_context
-def restore_file(ctx, file_path, revision):
+def restore_file(ctx, file_path, revision, dropbox_path, verbose):
     """Restore a user-selected file and revision from Dropbox."""
     dbx = ctx.obj["dbx"]
+    filename = os.path.basename(file_path)
+    dropbox_path = get_dropbox_path(file_path, filename, verbose)
 
     if not revision:
-        revision = help_select_revision(dbx, file_path)
+        revision = help_select_revision(dbx, dropbox_path)
+
         if not revision:
+            click.secho("Unexpected error with file revision", fg="red")
             return
 
+        if verbose:
+            # Ask the user to confirm the selected revision if verbose mode is enabled
+            confirm = (
+                click.prompt(
+                    f"Selected revision: {revision}. Do you want to continue with restoring this revision? (y/n)",
+                    type=str,
+                    default="n",
+                )
+                .strip()
+                .lower()
+            )
+            if confirm != "y":
+                return
+
     try:
-        restore(dbx, file_path, file_path, revision)
-        print(f"File {file_path} restored to revision {revision} successfully.")
+        restore(dbx, file_path, dropbox_path, revision, verbose)
+        click.secho(
+            f"File {file_path} restored to revision {revision} successfully.",
+            fg="green",
+        )
     except ApiError as err:
         if err.error.is_path() and err.error.get_path().reason.is_insufficient_space():
-            print("ERROR: Cannot restore; insufficient space.")
+            click.secho("ERROR: Cannot restore; insufficient space.", fg="red")
         elif err.user_message_text:
-            print(err.user_message_text)
+            click.secho(err.user_message_text, fg="red")
         else:
-            print(f"Error restoring file: {err}")
+            click.secho(f"Error restoring file: {err}", fg="red")
 
 
 cli.add_command(list_files)
